@@ -1,489 +1,752 @@
-"""
-charts.py — All chart functions for the Big Mac Index Dashboard
-Aesthetic: Editorial black, warm gold, restrained monochrome
-"""
-
+import streamlit as st
+import pandas as pd
+import os
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import matplotlib.colors as mcolors
-import matplotlib.ticker as mticker
-import seaborn as sns
-import pandas as pd
 import numpy as np
-from io import BytesIO
+from datetime import datetime
+import base64
+import charts
+import filters
 
-# ── THEME ─────────────────────────────────────────────────────────────────────
-BG      = "#0a0a0a"
-CARD    = "#0f0f0f"
-GOLD    = "#c8a96e"
-GOLD_LT = "#e0c99a"
-GOLD_DK = "#9a7a48"
-TEXT    = "#e8e0d4"
-MUTED   = "#555555"
-GRID    = "#1a1a1a"
-GREEN   = "#6fcf97"
-RED     = "#eb5757"
-BLUE    = "#5b9cf6"
-PURPLE  = "#9f7aea"
+# ── PAGE CONFIG ─────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Big Mac Index · Global Purchasing Power",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-PALETTE_GOLD = [
-    "#c8a96e", "#b8935a", "#a07d44", "#8a6830",
-    "#ddbf8e", "#eeddb0", "#f5ebcf",
-]
-GRADIENT = ["#1a0a00", "#3d2000", "#7a4800", "#b87000", "#c8a96e", "#e0c99a", "#f5ebcf"]
+# ── GLOBAL CSS ───────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=DM+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500;600&display=swap');
 
-
-def _setup_ax(ax, fig):
-    """Apply global dark theme to a single axes."""
-    fig.patch.set_facecolor(CARD)
-    ax.set_facecolor(CARD)
-    ax.tick_params(colors=MUTED, labelsize=9)
-    ax.xaxis.label.set_color(MUTED)
-    ax.yaxis.label.set_color(MUTED)
-    ax.title.set_color(TEXT)
-    for spine in ax.spines.values():
-        spine.set_color(GRID)
-    ax.set_axisbelow(True)
-    ax.grid(axis="y", color=GRID, linewidth=0.5, alpha=0.6)
-    ax.grid(axis="x", color=GRID, linewidth=0.5, alpha=0.6)
-
-
-def _new(w=10, h=5.5):
-    fig, ax = plt.subplots(figsize=(w, h))
-    _setup_ax(ax, fig)
-    return fig, ax
-
-
-def _font(ax, title=None, xlabel=None, ylabel=None, title_size=13):
-    if title:
-        ax.set_title(title, fontsize=title_size, color=TEXT, fontweight="bold",
-                     pad=14, loc="left")
-    if xlabel:
-        ax.set_xlabel(xlabel, fontsize=10, color=MUTED, labelpad=8)
-    if ylabel:
-        ax.set_ylabel(ylabel, fontsize=10, color=MUTED, labelpad=8)
-
-
-# ── 1. BAR — current prices ───────────────────────────────────────────────────
-def bar_current_prices(df: pd.DataFrame, top_n: int = 15) -> plt.Figure:
-    if df.empty:
-        return None
-    latest = df[df["year"] == df["year"].max()]
-    avg = latest.groupby("name")["dollar_price"].mean().nlargest(top_n).sort_values()
-
-    fig, ax = _new(9, max(4, len(avg) * 0.42))
-
-    colors = [GOLD if v == avg.max() else "#2a2a2a" for v in avg.values]
-    bars = ax.barh(avg.index, avg.values, color=colors, height=0.7, edgecolor="none")
-
-    # value labels
-    for bar, val in zip(bars, avg.values):
-        ax.text(val + 0.05, bar.get_y() + bar.get_height() / 2,
-                f"${val:.2f}", va="center", fontsize=8.5,
-                color=GOLD if val == avg.max() else MUTED,
-                fontfamily="monospace")
-
-    # US reference line
-    us_price = df[(df["year"] == df["year"].max()) & (df["name"] == "United States")]["dollar_price"].mean()
-    if not np.isnan(us_price):
-        ax.axvline(us_price, color=MUTED, linewidth=1, linestyle="--", alpha=0.5)
-        ax.text(us_price + 0.05, len(avg) - 0.5, f"US ${us_price:.2f}",
-                color=MUTED, fontsize=8, fontfamily="monospace", va="top")
-
-    ax.set_xlim(0, avg.max() * 1.22)
-    ax.grid(axis="x", color=GRID, linewidth=0.4)
-    ax.grid(axis="y", visible=False)
-    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.0f}"))
-    _font(ax, xlabel="Price (USD)")
-    fig.tight_layout()
-    return fig
-
-
-# ── 2. LOLLIPOP — over/under-valued ──────────────────────────────────────────
-def lollipop_overunder(df: pd.DataFrame, val_col: str = "usd_raw", top_n: int = 20) -> plt.Figure:
-    if df.empty or val_col not in df.columns:
-        return None
-    latest = df[df["year"] == df["year"].max()]
-    avg = latest.groupby("name")[val_col].mean().dropna()
-    avg = avg.reindex(avg.abs().nlargest(top_n).index).sort_values()
-
-    fig, ax = _new(8, max(4, len(avg) * 0.42))
-    fig.patch.set_facecolor(CARD)
-    ax.set_facecolor(CARD)
-
-    for spine in ax.spines.values():
-        spine.set_color(GRID)
-    ax.tick_params(colors=MUTED, labelsize=9)
-
-    for i, (country, val) in enumerate(avg.items()):
-        col = GREEN if val > 0 else RED
-        ax.hlines(i, 0, val, color=col, linewidth=1.5, alpha=0.7)
-        ax.scatter(val, i, color=col, s=40, zorder=5, edgecolors="none")
-
-    ax.axvline(0, color=MUTED, linewidth=0.8, linestyle="-", alpha=0.4)
-    ax.set_yticks(range(len(avg)))
-    ax.set_yticklabels(avg.index, fontsize=8.5, color=MUTED)
-    ax.grid(axis="x", color=GRID, linewidth=0.4, alpha=0.5)
-    ax.grid(axis="y", visible=False)
-    ax.xaxis.set_major_formatter(mticker.PercentFormatter(decimals=0))
-    _font(ax, xlabel="Over- / Under-Valued vs USD (%)")
-    fig.tight_layout()
-    return fig
-
-
-# ── 3. LINE — global average trend ───────────────────────────────────────────
-def line_global_avg(df: pd.DataFrame) -> plt.Figure:
-    if df.empty:
-        return None
-    trend = df.groupby("year")["dollar_price"].agg(["mean", "median", "std"]).reset_index()
-
-    fig, ax = _new(9, 5)
-    ax.fill_between(
-        trend["year"],
-        trend["mean"] - trend["std"],
-        trend["mean"] + trend["std"],
-        color=GOLD, alpha=0.08, label="±1 std dev"
-    )
-    ax.plot(trend["year"], trend["median"], color=MUTED, linewidth=1,
-            linestyle="--", label="Median", zorder=3)
-    ax.plot(trend["year"], trend["mean"], color=GOLD, linewidth=2.5,
-            label="Mean", zorder=4)
-    ax.scatter(trend["year"], trend["mean"], color=GOLD, s=50,
-               zorder=5, edgecolors=CARD, linewidth=1.5)
-
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.2f}"))
-    ax.set_xticks(trend["year"].unique()[::2])
-    ax.tick_params(axis="x", rotation=45)
-    ax.legend(fontsize=9, framealpha=0, labelcolor=MUTED)
-    _font(ax, ylabel="Price (USD)")
-    fig.tight_layout()
-    return fig
-
-
-# ── 4. RIDGELINE — price distribution per year ───────────────────────────────
-def ridgeline_years(df: pd.DataFrame) -> plt.Figure:
-    if df.empty:
-        return None
-    years = sorted(df["year"].unique())
-    n = len(years)
-    fig, axes = plt.subplots(n, 1, figsize=(8, max(5, n * 0.65)), sharex=True)
-    fig.patch.set_facecolor(CARD)
-    if n == 1:
-        axes = [axes]
-
-    for i, (ax, yr) in enumerate(zip(axes, years)):
-        data = df[df["year"] == yr]["dollar_price"].dropna()
-        if len(data) < 2:
-            continue
-        ax.set_facecolor(CARD)
-        ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-
-        alpha_val = 0.3 + 0.7 * (i / max(n - 1, 1))
-        color = GOLD
-        try:
-            from scipy.stats import gaussian_kde
-            kde = gaussian_kde(data)
-            xs  = np.linspace(data.min(), data.max(), 200)
-            ys  = kde(xs)
-            ax.fill_between(xs, ys, color=color, alpha=alpha_val * 0.5)
-            ax.plot(xs, ys, color=color, linewidth=1, alpha=alpha_val)
-        except Exception:
-            ax.hist(data, bins=15, color=color, alpha=0.4, density=True)
-
-        ax.text(ax.get_xlim()[0] if i == 0 else df["dollar_price"].min(),
-                ax.get_ylim()[1] * 0.5 if ax.get_ylim()[1] > 0 else 0.5,
-                str(yr), fontsize=8, color=MUTED, fontfamily="monospace", va="center")
-        ax.set_xlim(df["dollar_price"].min() - 0.5, df["dollar_price"].max() + 0.5)
-
-    axes[-1].tick_params(colors=MUTED, labelsize=8)
-    axes[-1].xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.0f}"))
-    fig.text(0.5, -0.01, "Price (USD)", ha="center", fontsize=9, color=MUTED)
-    fig.subplots_adjust(hspace=-0.3)
-    fig.tight_layout()
-    return fig
-
-
-# ── 5. HEATMAP — country × year ──────────────────────────────────────────────
-def heatmap_country_year(df: pd.DataFrame, top_n: int = 15) -> plt.Figure:
-    if df.empty:
-        return None
-    top_countries = df.groupby("name")["dollar_price"].mean().nlargest(top_n).index
-    subset = df[df["name"].isin(top_countries)]
-    pivot  = subset.pivot_table(index="name", columns="year",
-                                values="dollar_price", aggfunc="mean")
-
-    fig, ax = plt.subplots(figsize=(14, max(5, len(pivot) * 0.5)))
-    fig.patch.set_facecolor(CARD)
-    ax.set_facecolor(CARD)
-
-    cmap = mcolors.LinearSegmentedColormap.from_list(
-        "bm_gold", ["#0f0f0f", "#3a2400", GOLD_DK, GOLD, GOLD_LT], N=256
-    )
-    sns.heatmap(pivot, cmap=cmap, ax=ax, linewidths=0.3,
-                linecolor="#111", cbar_kws={"shrink": 0.6, "pad": 0.01},
-                fmt=".1f", annot=len(pivot.columns) <= 15,
-                annot_kws={"size": 7.5, "color": BG})
-
-    ax.tick_params(colors=MUTED, labelsize=9)
-    ax.set_xlabel("Year", fontsize=9, color=MUTED, labelpad=6)
-    ax.set_ylabel("", fontsize=9)
-    ax.tick_params(axis="x", rotation=45)
-
-    cbar = ax.collections[0].colorbar
-    cbar.ax.yaxis.set_tick_params(color=MUTED, labelsize=8)
-    plt.setp(cbar.ax.yaxis.get_ticklabels(), color=MUTED)
-    cbar.set_label("Avg Price (USD)", color=MUTED, fontsize=8)
-
-    fig.tight_layout()
-    return fig
-
-
-# ── 6. SCATTER — raw vs GDP-adjusted ─────────────────────────────────────────
-def scatter_raw_vs_adj(df: pd.DataFrame) -> plt.Figure:
-    if df.empty or "usd_raw" not in df.columns or "usd_adjusted" not in df.columns:
-        return None
-    latest = df[df["year"] == df["year"].max()].dropna(subset=["usd_raw", "usd_adjusted"])
-
-    fig, ax = _new(8, 6)
-    ax.scatter(latest["usd_raw"], latest["usd_adjusted"],
-               color=GOLD, alpha=0.7, s=55, edgecolors=CARD, linewidth=0.8, zorder=4)
-
-    # Labels for extreme points
-    extremes = pd.concat([
-        latest.nlargest(4, "usd_raw"),
-        latest.nsmallest(4, "usd_raw"),
-    ]).drop_duplicates()
-    for _, row in extremes.iterrows():
-        ax.annotate(row["name"],
-                    (row["usd_raw"], row["usd_adjusted"]),
-                    fontsize=7.5, color=MUTED, fontfamily="monospace",
-                    xytext=(5, 5), textcoords="offset points")
-
-    ax.axhline(0, color=MUTED, linewidth=0.7, linestyle="--", alpha=0.4)
-    ax.axvline(0, color=MUTED, linewidth=0.7, linestyle="--", alpha=0.4)
-    ax.xaxis.set_major_formatter(mticker.PercentFormatter(decimals=0))
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(decimals=0))
-    _font(ax, xlabel="Raw Index (%)", ylabel="GDP-Adjusted Index (%)")
-    fig.tight_layout()
-    return fig
-
-
-# ── 7. AREA — top N countries price trajectory ────────────────────────────────
-def area_top_countries(df: pd.DataFrame, top_n: int = 8) -> plt.Figure:
-    if df.empty:
-        return None
-    top_c = df.groupby("name")["dollar_price"].mean().nlargest(min(top_n, 8)).index
-    subset = df[df["name"].isin(top_c)]
-    trend  = subset.groupby(["year", "name"])["dollar_price"].mean().reset_index()
-
-    fig, ax = _new(11, 5.5)
-    colors = plt.cm.get_cmap("YlOrBr", len(top_c))
-    for i, country in enumerate(top_c):
-        cdata = trend[trend["name"] == country].sort_values("year")
-        col = mcolors.to_hex(colors(i / max(len(top_c) - 1, 1)))
-        ax.plot(cdata["year"], cdata["dollar_price"], color=col,
-                linewidth=2, label=country, zorder=4)
-        ax.fill_between(cdata["year"], cdata["dollar_price"],
-                        color=col, alpha=0.06)
-
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.2f}"))
-    ax.set_xticks(trend["year"].unique()[::2])
-    ax.tick_params(axis="x", rotation=45)
-    ax.legend(fontsize=8, framealpha=0, labelcolor=MUTED,
-              loc="upper left", ncol=2)
-    _font(ax, ylabel="Price (USD)")
-    fig.tight_layout()
-    return fig
-
-
-# ── 8. VIOLIN — price by region ──────────────────────────────────────────────
-REGION_MAP = {
-    "United States": "North America", "Canada": "North America", "Mexico": "Latin America",
-    "Brazil": "Latin America", "Argentina": "Latin America", "Chile": "Latin America",
-    "Colombia": "Latin America", "Peru": "Latin America", "Venezuela": "Latin America",
-    "United Kingdom": "Europe", "Euro area": "Europe", "Norway": "Europe",
-    "Sweden": "Europe", "Denmark": "Europe", "Switzerland": "Europe",
-    "Poland": "Europe", "Czech Republic": "Europe", "Hungary": "Europe",
-    "Russia": "Europe", "Turkey": "Europe", "Ukraine": "Europe",
-    "China": "Asia-Pacific", "Japan": "Asia-Pacific", "South Korea": "Asia-Pacific",
-    "Australia": "Asia-Pacific", "New Zealand": "Asia-Pacific",
-    "Indonesia": "Asia-Pacific", "Malaysia": "Asia-Pacific",
-    "Philippines": "Asia-Pacific", "Thailand": "Asia-Pacific", "India": "Asia-Pacific",
-    "Pakistan": "Asia-Pacific", "Sri Lanka": "Asia-Pacific", "Taiwan": "Asia-Pacific",
-    "Hong Kong": "Asia-Pacific", "Singapore": "Asia-Pacific",
-    "South Africa": "Africa & ME", "Egypt": "Africa & ME",
-    "Saudi Arabia": "Africa & ME", "Israel": "Africa & ME", "UAE": "Africa & ME",
+/* ─── Base ─── */
+html, body, .stApp {
+    background: #0a0a0a !important;
+    font-family: 'DM Sans', sans-serif;
+    color: #e8e0d4;
+}
+.block-container {
+    padding: 2rem 3rem 4rem;
+    max-width: 1500px;
 }
 
-def violin_regions(df: pd.DataFrame) -> plt.Figure:
-    if df.empty:
-        return None
-    df2 = df.copy()
-    df2["region"] = df2["name"].map(REGION_MAP).fillna("Other")
+/* ─── Sidebar ─── */
+[data-testid="stSidebar"] {
+    background: #0f0f0f !important;
+    border-right: 1px solid #1e1e1e;
+}
+[data-testid="stSidebar"] .stMarkdown p,
+[data-testid="stSidebar"] label {
+    font-family: 'DM Mono', monospace !important;
+    font-size: 11px !important;
+    color: #666 !important;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+}
+[data-testid="stSidebar"] [data-testid="stSlider"] > div > div > div {
+    background: #c8a96e !important;
+}
+[data-testid="stSidebar"] [data-testid="stSlider"] > div > div > div > div {
+    background: #c8a96e !important;
+    border: 2px solid #0f0f0f;
+}
 
-    fig, ax = _new(9, 5.5)
-    order = df2.groupby("region")["dollar_price"].median().sort_values(ascending=False).index.tolist()
-    pal   = {r: GOLD if i == 0 else f"#{max(0x1a, 0x60 - i*0x08):02x}{max(0x10, 0x40 - i*0x06):02x}{max(0x00, 0x00):02x}"
-             for i, r in enumerate(order)}
+/* ─── Dividers ─── */
+hr {
+    border-color: #1e1e1e !important;
+}
 
-    sns.violinplot(data=df2, x="region", y="dollar_price", order=order,
-                   hue="region", palette=pal, legend=False,
-                   inner="quartile", ax=ax, cut=0, linewidth=0.8)
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=25, ha="right", fontsize=8.5)
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.2f}"))
-    ax.grid(axis="y", color=GRID, linewidth=0.4)
-    ax.grid(axis="x", visible=False)
-    _font(ax, ylabel="Price (USD)")
-    fig.tight_layout()
-    return fig
+/* ─── Header ─── */
+.hero-wrap {
+    position: relative;
+    overflow: hidden;
+    border: 1px solid #1e1e1e;
+    border-radius: 4px;
+    background: #0f0f0f;
+    padding: 48px 52px 40px;
+    margin-bottom: 36px;
+}
+.hero-wrap::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: radial-gradient(ellipse 70% 60% at 80% 50%, rgba(200,169,110,0.07) 0%, transparent 70%);
+    pointer-events: none;
+}
+.hero-eyebrow {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 3px;
+    color: #c8a96e;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.hero-eyebrow::after {
+    content: '';
+    flex: 1;
+    max-width: 60px;
+    height: 1px;
+    background: #c8a96e;
+    opacity: 0.4;
+}
+.hero-title {
+    font-family: 'Playfair Display', serif;
+    font-size: 56px;
+    font-weight: 900;
+    color: #e8e0d4;
+    line-height: 1.05;
+    letter-spacing: -1.5px;
+    margin: 0 0 6px;
+}
+.hero-title em {
+    font-style: italic;
+    color: #c8a96e;
+}
+.hero-sub {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 15px;
+    color: #555;
+    margin-top: 16px;
+    max-width: 560px;
+    line-height: 1.7;
+    font-weight: 300;
+}
+.hero-tag-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 28px;
+    flex-wrap: wrap;
+}
+.hero-tag {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 1px;
+    color: #444;
+    border: 1px solid #222;
+    border-radius: 2px;
+    padding: 5px 10px;
+    text-transform: uppercase;
+}
+
+/* ─── Section headings ─── */
+.sec-head {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    margin: 40px 0 24px;
+    border-bottom: 1px solid #1a1a1a;
+    padding-bottom: 14px;
+}
+.sec-num {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    color: #c8a96e;
+    letter-spacing: 2px;
+    opacity: 0.7;
+}
+.sec-title {
+    font-family: 'Playfair Display', serif;
+    font-size: 22px;
+    font-weight: 700;
+    color: #e8e0d4;
+    letter-spacing: -0.3px;
+    margin: 0;
+}
+
+/* ─── KPI / Stat cards ─── */
+.kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: #1a1a1a;
+    border: 1px solid #1a1a1a;
+    margin-bottom: 28px;
+}
+.kpi-card {
+    background: #0f0f0f;
+    padding: 28px 24px;
+    position: relative;
+    overflow: hidden;
+    transition: background 0.3s;
+}
+.kpi-card:hover { background: #141414; }
+.kpi-card::after {
+    content: '';
+    position: absolute;
+    bottom: 0; left: 24px; right: 24px;
+    height: 2px;
+    background: linear-gradient(90deg, #c8a96e, transparent);
+    opacity: 0;
+    transition: opacity 0.3s;
+}
+.kpi-card:hover::after { opacity: 1; }
+.kpi-label {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: #444;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+}
+.kpi-value {
+    font-family: 'Playfair Display', serif;
+    font-size: 36px;
+    font-weight: 700;
+    color: #c8a96e;
+    line-height: 1;
+    letter-spacing: -1px;
+}
+.kpi-delta {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    color: #555;
+    margin-top: 6px;
+}
+.kpi-delta.up { color: #6fcf97; }
+.kpi-delta.down { color: #eb5757; }
+
+/* ─── Chart wrapper ─── */
+.chart-shell {
+    background: #0f0f0f;
+    border: 1px solid #1a1a1a;
+    border-radius: 3px;
+    padding: 0;
+    margin-bottom: 16px;
+    overflow: hidden;
+    position: relative;
+}
+.chart-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 22px 14px;
+    border-bottom: 1px solid #1a1a1a;
+}
+.chart-title {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: #555;
+    text-transform: uppercase;
+}
+.chart-body {
+    padding: 0;
+}
+.chart-body img {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+.dl-btn {
+    font-family: 'DM Mono', monospace;
+    font-size: 9px;
+    letter-spacing: 1px;
+    color: #333;
+    border: 1px solid #222;
+    border-radius: 2px;
+    padding: 4px 10px;
+    text-decoration: none;
+    text-transform: uppercase;
+    transition: all 0.2s;
+}
+.dl-btn:hover {
+    color: #c8a96e;
+    border-color: #c8a96e;
+}
+
+/* ─── Tabs ─── */
+.stTabs [data-baseweb="tab-list"] {
+    background: transparent !important;
+    border-bottom: 1px solid #1a1a1a !important;
+    gap: 0 !important;
+    padding: 0 !important;
+}
+.stTabs [data-baseweb="tab"] {
+    font-family: 'DM Mono', monospace !important;
+    font-size: 11px !important;
+    letter-spacing: 1.5px !important;
+    text-transform: uppercase !important;
+    color: #444 !important;
+    background: transparent !important;
+    border: none !important;
+    border-bottom: 2px solid transparent !important;
+    padding: 10px 24px !important;
+    border-radius: 0 !important;
+    transition: all 0.2s !important;
+}
+.stTabs [data-baseweb="tab"]:hover {
+    color: #888 !important;
+}
+.stTabs [aria-selected="true"] {
+    color: #c8a96e !important;
+    border-bottom: 2px solid #c8a96e !important;
+    background: transparent !important;
+}
+
+/* ─── Data table ─── */
+[data-testid="stDataFrame"] {
+    border: 1px solid #1a1a1a !important;
+    border-radius: 3px !important;
+}
+
+/* ─── Buttons ─── */
+.stButton > button {
+    font-family: 'DM Mono', monospace !important;
+    font-size: 11px !important;
+    letter-spacing: 1.5px !important;
+    text-transform: uppercase !important;
+    background: transparent !important;
+    color: #c8a96e !important;
+    border: 1px solid #c8a96e !important;
+    border-radius: 2px !important;
+    padding: 8px 20px !important;
+    transition: all 0.2s !important;
+}
+.stButton > button:hover {
+    background: rgba(200,169,110,0.1) !important;
+}
+
+/* ─── Download button ─── */
+.stDownloadButton > button {
+    font-family: 'DM Mono', monospace !important;
+    font-size: 10px !important;
+    letter-spacing: 1px !important;
+    text-transform: uppercase !important;
+    background: transparent !important;
+    color: #555 !important;
+    border: 1px solid #222 !important;
+    border-radius: 2px !important;
+    transition: all 0.2s !important;
+}
+.stDownloadButton > button:hover {
+    color: #c8a96e !important;
+    border-color: #c8a96e !important;
+}
+
+/* ─── Filter badge ─── */
+.fbadge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 1px;
+    color: #c8a96e;
+    background: rgba(200,169,110,0.08);
+    border: 1px solid rgba(200,169,110,0.2);
+    border-radius: 2px;
+    padding: 4px 10px;
+    margin: 3px;
+}
+
+/* ─── Insight callout ─── */
+.insight-box {
+    background: #0f0f0f;
+    border-left: 3px solid #c8a96e;
+    padding: 18px 22px;
+    margin: 12px 0 24px;
+    font-family: 'DM Sans', sans-serif;
+    font-size: 14px;
+    color: #888;
+    line-height: 1.7;
+    font-weight: 300;
+}
+.insight-box strong {
+    color: #e8e0d4;
+    font-weight: 500;
+}
+
+/* ─── Scrollbar ─── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: #0a0a0a; }
+::-webkit-scrollbar-thumb { background: #222; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #333; }
+
+/* ─── Multiselect & selectbox ─── */
+[data-baseweb="select"] > div:first-child {
+    background: #111 !important;
+    border: 1px solid #222 !important;
+    border-radius: 2px !important;
+}
+
+/* ─── Alert ─── */
+[data-testid="stAlert"] {
+    background: #0f0f0f !important;
+    border: 1px solid #1e1e1e !important;
+    border-radius: 3px !important;
+    color: #555 !important;
+    font-family: 'DM Mono', monospace !important;
+    font-size: 12px !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
-# ── 9. HORIZONTAL BAR — biggest movers ───────────────────────────────────────
-def bar_most_changed(df: pd.DataFrame, top_n: int = 15) -> plt.Figure:
-    if df.empty:
-        return None
-    first_yr = df["year"].min()
-    last_yr  = df["year"].max()
-    first = df[df["year"] == first_yr].groupby("name")["dollar_price"].mean()
-    last  = df[df["year"] == last_yr].groupby("name")["dollar_price"].mean()
-    change = ((last - first) / first * 100).dropna().sort_values()
-    change = pd.concat([change.head(8), change.tail(8)]).drop_duplicates()
-
-    fig, ax = _new(9, max(4, len(change) * 0.48))
-    colors = [GREEN if v > 0 else RED for v in change.values]
-    ax.barh(change.index, change.values, color=colors, height=0.65,
-            alpha=0.85, edgecolor="none")
-    ax.axvline(0, color=MUTED, linewidth=0.8, alpha=0.4)
-    for val, y in zip(change.values, range(len(change))):
-        ax.text(val + (1 if val > 0 else -1), y,
-                f"{val:+.0f}%", va="center", fontsize=8,
-                color=GREEN if val > 0 else RED, fontfamily="monospace")
-    ax.set_xlim(change.min() * 1.25, change.max() * 1.25)
-    ax.xaxis.set_major_formatter(mticker.PercentFormatter(decimals=0))
-    ax.grid(axis="x", color=GRID, linewidth=0.4)
-    ax.grid(axis="y", visible=False)
-    _font(ax, xlabel=f"Price Change {first_yr}→{last_yr}")
-    fig.tight_layout()
-    return fig
+# ── DATA LOADING ─────────────────────────────────────────────────────────────
+@st.cache_data
+def load_data(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, parse_dates=["date"])
+    df["year"] = df["date"].dt.year
+    df["month"] = df["date"].dt.month
+    df["dollar_price"] = pd.to_numeric(df["dollar_price"], errors="coerce")
+    df["usd_raw"] = pd.to_numeric(df["usd_raw"], errors="coerce")
+    df["usd_adjusted"] = pd.to_numeric(df["usd_adjusted"], errors="coerce")
+    df.dropna(subset=["dollar_price"], inplace=True)
+    return df
 
 
-# ── 10. HISTOGRAM — global price dist ────────────────────────────────────────
-def hist_price_dist(df: pd.DataFrame) -> plt.Figure:
-    if df.empty:
-        return None
-    fig, ax = _new(8, 5)
-    prices = df["dollar_price"].dropna()
+DATA_PATH = os.path.join("data", "big-mac.csv")
 
-    n, bins, patches = ax.hist(prices, bins=40, color=GOLD, alpha=0.75,
-                                edgecolor=CARD, linewidth=0.5)
-    # Color the tallest bar gold, rest darker
-    max_n = n.max()
-    for patch, h in zip(patches, n):
-        patch.set_facecolor(GOLD if h == max_n else GOLD_DK)
-        patch.set_alpha(0.6 + 0.4 * (h / max_n))
+if not os.path.exists(DATA_PATH):
+    st.markdown("""
+    <div style="padding:80px 40px;text-align:center;">
+        <div style="font-family:'DM Mono',monospace;font-size:11px;letter-spacing:3px;color:#c8a96e;margin-bottom:20px;">
+            DATA NOT FOUND
+        </div>
+        <div style="font-family:'Playfair Display',serif;font-size:36px;color:#e8e0d4;margin-bottom:16px;">
+            Place <em style="color:#c8a96e;">big-mac.csv</em> in the data/ folder
+        </div>
+        <div style="font-family:'DM Sans',sans-serif;font-size:14px;color:#555;max-width:500px;margin:0 auto;">
+            Download from:<br>
+            <code style="color:#888;font-size:12px;">
+            https://github.com/rfordatascience/tidytuesday/blob/main/data/2020/2020-12-22/big-mac.csv
+            </code>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
 
-    ax.axvline(prices.mean(), color=TEXT, linewidth=1.5, linestyle="--",
-               label=f"Mean ${prices.mean():.2f}", zorder=5)
-    ax.axvline(prices.median(), color=MUTED, linewidth=1, linestyle=":",
-               label=f"Median ${prices.median():.2f}", zorder=5)
+df = load_data(DATA_PATH)
 
-    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.0f}"))
-    ax.legend(fontsize=9, framealpha=0, labelcolor=MUTED)
-    ax.grid(axis="y", color=GRID, linewidth=0.4)
-    ax.grid(axis="x", visible=False)
-    _font(ax, xlabel="Price (USD)", ylabel="Frequency")
-    fig.tight_layout()
-    return fig
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("""
+    <div style="padding:24px 0 8px;">
+        <div style="font-family:'DM Mono',monospace;font-size:9px;letter-spacing:3px;color:#c8a96e;text-transform:uppercase;">
+            Controls
+        </div>
+        <div style="font-family:'Playfair Display',serif;font-size:20px;color:#e8e0d4;margin-top:6px;">
+            Filter & Explore
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.divider()
+
+    min_year = int(df["year"].min())
+    max_year = int(df["year"].max())
+    all_countries = sorted(df["name"].dropna().unique().tolist())
+
+    if "reset" not in st.session_state:
+        st.session_state.reset = False
+
+    sfx = "_r" if st.session_state.reset else ""
+
+    selected_years = st.sidebar.slider(
+        "Year Range",
+        min_value=min_year, max_value=max_year,
+        value=(min_year, max_year), key=f"yr{sfx}"
+    )
+    selected_countries = st.sidebar.multiselect(
+        "Countries",
+        options=all_countries, default=[],
+        key=f"cc{sfx}", help="Leave blank for all countries"
+    )
+    val_type = st.sidebar.radio(
+        "Price Metric",
+        ["Raw USD Index", "GDP-Adjusted Index"],
+        key=f"vm{sfx}"
+    )
+    top_n = st.sidebar.slider(
+        "Top N Countries in Charts", 5, 30, 15, key=f"tn{sfx}"
+    )
+
+    st.divider()
+    if st.button("↺  Reset Filters"):
+        st.session_state.reset = not st.session_state.reset
+        st.rerun()
+
+    if st.session_state.reset:
+        st.session_state.reset = False
+
+    st.markdown("""
+    <div style="padding:20px 0 0;font-family:'DM Mono',monospace;font-size:9px;letter-spacing:1px;color:#2a2a2a;line-height:2;">
+        SOURCE · The Economist<br>
+        DATASET · TidyTuesday 2020<br>
+        VIZ · Big Mac Index Dashboard
+    </div>
+    """, unsafe_allow_html=True)
 
 
-# ── 11. BOX — per year ───────────────────────────────────────────────────────
-def box_by_year(df: pd.DataFrame) -> plt.Figure:
-    if df.empty:
-        return None
-    years = sorted(df["year"].unique())
-    fig, ax = _new(12, 5)
+# ── FILTER DATA ───────────────────────────────────────────────────────────────
+filtered = filters.apply_filters(df, selected_years, selected_countries)
+val_col = "usd_raw" if val_type == "Raw USD Index" else "usd_adjusted"
 
-    cmap   = plt.cm.get_cmap("YlOrBr", len(years))
-    colors = [mcolors.to_hex(cmap(i / max(len(years) - 1, 1))) for i in range(len(years))]
+# ── HERO HEADER ───────────────────────────────────────────────────────────────
+st.markdown(f"""
+<div class="hero-wrap">
+    <div class="hero-eyebrow">The Economist · Big Mac Index</div>
+    <div class="hero-title">The World Through a<br><em>Single Burger</em></div>
+    <div class="hero-sub">
+        Purchasing power parity, visualised through the world's most iconic fast-food item.
+        Tracking {df['name'].nunique()} countries from {min_year} to {max_year}.
+    </div>
+    <div class="hero-tag-row">
+        <span class="hero-tag">PPP Analysis</span>
+        <span class="hero-tag">{len(df):,} Observations</span>
+        <span class="hero-tag">{df['name'].nunique()} Countries</span>
+        <span class="hero-tag">{max_year - min_year + 1} Years</span>
+        <span class="hero-tag">The Economist Dataset</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-    data_by_year = [df[df["year"] == yr]["dollar_price"].dropna().values for yr in years]
-    bp = ax.boxplot(data_by_year, patch_artist=True, vert=True,
-                    medianprops=dict(color=TEXT, linewidth=1.5),
-                    whiskerprops=dict(color=MUTED, linewidth=0.8),
-                    capprops=dict(color=MUTED, linewidth=0.8),
-                    flierprops=dict(marker=".", color=MUTED, alpha=0.3, markersize=3))
-
-    for patch, col in zip(bp["boxes"], colors):
-        patch.set_facecolor(col)
-        patch.set_alpha(0.7)
-        patch.set_edgecolor(GRID)
-
-    ax.set_xticks(range(1, len(years) + 1))
-    ax.set_xticklabels(years, rotation=45, fontsize=8.5, color=MUTED)
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.2f}"))
-    ax.grid(axis="y", color=GRID, linewidth=0.4)
-    ax.grid(axis="x", visible=False)
-    _font(ax, ylabel="Price (USD)")
-    fig.tight_layout()
-    return fig
+# active filter badges
+active = []
+if selected_years != (min_year, max_year):
+    active.append(f"Years {selected_years[0]}–{selected_years[1]}")
+if selected_countries:
+    active.append(f"{len(selected_countries)} countries selected")
+if active:
+    badges = "".join(f'<span class="fbadge">◈ {a}</span>' for a in active)
+    st.markdown(f'<div style="margin-bottom:20px;">{badges}</div>', unsafe_allow_html=True)
 
 
-# ── 12. BUBBLE — country summary ─────────────────────────────────────────────
-def bubble_country_summary(df: pd.DataFrame, val_col: str = "usd_raw") -> plt.Figure:
-    if df.empty:
-        return None
-    agg = (
-        df.groupby("name")
+if filtered.empty:
+    st.warning("No data for the selected filters.")
+    st.stop()
+
+
+# ── KPI CARDS ────────────────────────────────────────────────────────────────
+latest_year = filtered["year"].max()
+latest = filtered[filtered["year"] == latest_year]
+prev_year = latest_year - 1
+prev = filtered[filtered["year"] == prev_year]
+
+avg_price_now  = latest["dollar_price"].mean()
+avg_price_prev = prev["dollar_price"].mean() if not prev.empty else avg_price_now
+price_chg      = ((avg_price_now - avg_price_prev) / avg_price_prev * 100) if avg_price_prev else 0
+
+most_expensive = latest.loc[latest["dollar_price"].idxmax(), "name"] if not latest.empty else "N/A"
+cheapest       = latest.loc[latest["dollar_price"].idxmin(), "name"] if not latest.empty else "N/A"
+spread         = latest["dollar_price"].max() - latest["dollar_price"].min() if not latest.empty else 0
+n_countries    = filtered["name"].nunique()
+
+delta_class = "up" if price_chg >= 0 else "down"
+delta_arrow = "↑" if price_chg >= 0 else "↓"
+
+st.markdown(f"""
+<div class="kpi-grid">
+    <div class="kpi-card">
+        <div class="kpi-label">Avg. Big Mac Price ({latest_year})</div>
+        <div class="kpi-value">${avg_price_now:.2f}</div>
+        <div class="kpi-delta {delta_class}">{delta_arrow} {abs(price_chg):.1f}% vs {prev_year}</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-label">Most Expensive ({latest_year})</div>
+        <div class="kpi-value" style="font-size:28px;">{most_expensive}</div>
+        <div class="kpi-delta">${latest.loc[latest['dollar_price'].idxmax(),'dollar_price']:.2f} USD</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-label">Most Affordable ({latest_year})</div>
+        <div class="kpi-value" style="font-size:28px;">{cheapest}</div>
+        <div class="kpi-delta">${latest.loc[latest['dollar_price'].idxmin(),'dollar_price']:.2f} USD</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-label">Countries Tracked</div>
+        <div class="kpi-value">{n_countries}</div>
+        <div class="kpi-delta">Price spread: ${spread:.2f}</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ── RENDER CHART HELPER ───────────────────────────────────────────────────────
+def render_chart(fig, title: str, fname: str):
+    if fig is None:
+        return
+    from io import BytesIO
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    buf.seek(0)
+    b64 = base64.b64encode(buf.read()).decode()
+    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    st.markdown(f"""
+    <div class="chart-shell">
+        <div class="chart-header">
+            <span class="chart-title">{title}</span>
+            <a class="dl-btn" href="data:image/png;base64,{b64}" download="{fname}_{ts}.png">↓ Export</a>
+        </div>
+        <div class="chart-body">
+            <img src="data:image/png;base64,{b64}" alt="{title}" />
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    plt.close(fig)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SECTION A · PRICE LANDSCAPE
+# ════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<div class="sec-head">
+    <span class="sec-num">01 ——</span>
+    <span class="sec-title">Price Landscape</span>
+</div>
+""", unsafe_allow_html=True)
+
+c1, c2 = st.columns([3, 2])
+with c1:
+    fig = charts.bar_current_prices(filtered, top_n)
+    render_chart(fig, "BIG MAC PRICE BY COUNTRY · LATEST YEAR (USD)", "price_ranking")
+with c2:
+    fig = charts.lollipop_overunder(filtered, val_col, top_n)
+    render_chart(fig, f"OVER / UNDER-VALUED vs USD · {val_type.upper()}", "over_under_valued")
+
+st.markdown("""
+<div class="insight-box">
+    <strong>Reading this:</strong> The lollipop chart shows each currency's valuation relative to the US dollar.
+    Bars extending right indicate an <strong>over-valued</strong> currency; bars left indicate <strong>under-valued</strong>.
+    A Big Mac costing less than in the US implies the local currency has more purchasing power per dollar.
+</div>
+""", unsafe_allow_html=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SECTION B · TIME EVOLUTION
+# ════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<div class="sec-head">
+    <span class="sec-num">02 ——</span>
+    <span class="sec-title">Price Evolution Over Time</span>
+</div>
+""", unsafe_allow_html=True)
+
+c3, c4 = st.columns(2)
+with c3:
+    fig = charts.line_global_avg(filtered)
+    render_chart(fig, "GLOBAL AVERAGE PRICE TREND · ALL COUNTRIES", "global_avg_trend")
+with c4:
+    fig = charts.ridgeline_years(filtered)
+    render_chart(fig, "PRICE DISTRIBUTION · EACH YEAR", "distribution_years")
+
+fig = charts.heatmap_country_year(filtered, top_n)
+render_chart(fig, f"PRICE HEATMAP · TOP {top_n} COUNTRIES × YEAR (USD)", "heatmap_country_year")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SECTION C · VALUATION ANALYSIS
+# ════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<div class="sec-head">
+    <span class="sec-num">03 ——</span>
+    <span class="sec-title">Valuation & PPP Analysis</span>
+</div>
+""", unsafe_allow_html=True)
+
+c5, c6 = st.columns([2, 3])
+with c5:
+    fig = charts.scatter_raw_vs_adj(filtered)
+    render_chart(fig, "RAW vs GDP-ADJUSTED INDEX", "raw_vs_adjusted")
+with c6:
+    fig = charts.area_top_countries(filtered, top_n)
+    render_chart(fig, f"PRICE TRAJECTORIES · TOP {top_n} COUNTRIES", "top_countries_area")
+
+c7, c8 = st.columns(2)
+with c7:
+    fig = charts.violin_regions(filtered)
+    render_chart(fig, "PRICE SPREAD BY REGION", "violin_regions")
+with c8:
+    fig = charts.bar_most_changed(filtered)
+    render_chart(fig, "BIGGEST PRICE MOVERS (FIRST→LAST YEAR)", "biggest_movers")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SECTION D · STATISTICAL DEEP DIVE
+# ════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<div class="sec-head">
+    <span class="sec-num">04 ——</span>
+    <span class="sec-title">Statistical Deep Dive</span>
+</div>
+""", unsafe_allow_html=True)
+
+c9, c10 = st.columns(2)
+with c9:
+    fig = charts.hist_price_dist(filtered)
+    render_chart(fig, "GLOBAL PRICE DISTRIBUTION (USD)", "price_distribution")
+with c10:
+    fig = charts.box_by_year(filtered)
+    render_chart(fig, "PRICE SPREAD PER YEAR · BOX PLOT", "box_per_year")
+
+fig = charts.bubble_country_summary(filtered, val_col)
+render_chart(fig, "COUNTRY SUMMARY · PRICE × INDEX × OBSERVATIONS (BUBBLE SIZE)", "country_bubble")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SECTION E · DATA TABLE
+# ════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<div class="sec-head">
+    <span class="sec-num">05 ——</span>
+    <span class="sec-title">Data Explorer</span>
+</div>
+""", unsafe_allow_html=True)
+
+tab_summary, tab_raw = st.tabs(["Country Summary", "Raw Data"])
+
+with tab_summary:
+    summary = (
+        filtered.groupby("name")
         .agg(
             avg_price=("dollar_price", "mean"),
-            index_val=(val_col, "mean"),
-            obs=("dollar_price", "count"),
+            min_price=("dollar_price", "min"),
+            max_price=("dollar_price", "max"),
+            avg_raw_index=("usd_raw", "mean"),
+            avg_adj_index=("usd_adjusted", "mean"),
+            observations=("dollar_price", "count"),
         )
-        .dropna()
+        .round(3)
+        .sort_values("avg_price", ascending=False)
         .reset_index()
     )
-
-    fig, ax = _new(11, 7)
-    scatter = ax.scatter(
-        agg["avg_price"], agg["index_val"],
-        s=agg["obs"] * 4,
-        c=agg["avg_price"],
-        cmap=mcolors.LinearSegmentedColormap.from_list(
-            "bm", [CARD, GOLD_DK, GOLD, GOLD_LT], N=256),
-        alpha=0.75,
-        edgecolors=GRID, linewidth=0.5,
-        zorder=4,
+    summary.columns = ["Country", "Avg Price ($)", "Min Price ($)", "Max Price ($)",
+                        "Avg Raw Index", "Avg Adj Index", "Observations"]
+    st.dataframe(summary, width='stretch', height=400)
+    st.download_button(
+        "↓ Download Country Summary",
+        summary.to_csv(index=False),
+        file_name=f"bigmac_country_summary_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv"
     )
 
-    # Label the most interesting ones
-    for _, row in agg.nlargest(5, "avg_price").iterrows():
-        ax.annotate(row["name"], (row["avg_price"], row["index_val"]),
-                    fontsize=7.5, color=MUTED, fontfamily="monospace",
-                    xytext=(6, 3), textcoords="offset points")
-    for _, row in agg.nsmallest(5, "avg_price").iterrows():
-        ax.annotate(row["name"], (row["avg_price"], row["index_val"]),
-                    fontsize=7.5, color=MUTED, fontfamily="monospace",
-                    xytext=(6, 3), textcoords="offset points")
+with tab_raw:
+    disp_cols = ["date", "name", "iso_a3", "dollar_price", "usd_raw", "usd_adjusted", "year"]
+    avail = [c for c in disp_cols if c in filtered.columns]
+    st.dataframe(
+        filtered[avail].sort_values("date", ascending=False),
+        width='stretch', height=400
+    )
+    st.download_button(
+        "↓ Download Filtered Data",
+        filtered[avail].to_csv(index=False),
+        file_name=f"bigmac_filtered_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv"
+    )
 
-    cbar = plt.colorbar(scatter, ax=ax, shrink=0.7, pad=0.02)
-    cbar.ax.yaxis.set_tick_params(color=MUTED, labelsize=8)
-    plt.setp(cbar.ax.yaxis.get_ticklabels(), color=MUTED)
-    cbar.set_label("Avg Price (USD)", color=MUTED, fontsize=8)
-    cbar.ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.2f}"))
-
-    ax.axhline(0, color=MUTED, linewidth=0.7, linestyle="--", alpha=0.3)
-    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:.2f}"))
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(decimals=0))
-    _font(ax, xlabel="Average Price (USD)", ylabel=f"{val_col.replace('_',' ').title()} (%)")
-
-    # Bubble size legend
-    for sz in [5, 10, 20]:
-        ax.scatter([], [], s=sz * 4, color=GOLD, alpha=0.5,
-                   label=f"{sz} obs", edgecolors=GRID, linewidth=0.5)
-    ax.legend(title="Observations", fontsize=8, framealpha=0,
-              labelcolor=MUTED, title_fontsize=8)
-
-    fig.tight_layout()
-    return fig
+# ── FOOTER ────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div style="margin-top:60px;padding:32px 0 12px;border-top:1px solid #141414;
+            display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+    <div style="font-family:'Playfair Display',serif;font-size:18px;color:#2a2a2a;font-style:italic;">
+        Big Mac Index Dashboard
+    </div>
+    <div style="font-family:'DM Mono',monospace;font-size:9px;letter-spacing:2px;color:#2a2a2a;text-transform:uppercase;">
+        Data: The Economist · TidyTuesday 2020 · Built with Streamlit
+    </div>
+</div>
+""", unsafe_allow_html=True)
